@@ -5,6 +5,7 @@ const zones = require('./zones');
 const customers = require('./customers');
 const waybills = require('./waybills');
 const bills = require('./bills');
+const compare = require('./compare');
 const pricing = require('./pricing');
 
 function buildSummary() {
@@ -84,6 +85,8 @@ function createRouter() {
   router.patch('/waybills/:id', (req, res) => res.json(waybills.updateWaybill(req.params.id, req.body || {})));
   router.delete('/waybills/:id', (req, res) => res.json(waybills.removeWaybill(req.params.id)));
   router.post('/waybills/:id/quote', (req, res) => res.json(waybills.quote(req.params.id)));
+
+  router.post('/compare', (req, res) => res.json(compare.comparePricing(req.body || {})));
 
   router.get('/bills', (req, res) => res.json(bills.listBills(req.query || {})));
   router.get('/periods', (req, res) => res.json(bills.listPeriods()));

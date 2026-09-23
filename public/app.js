@@ -5,7 +5,7 @@
   /* ================= 常量 ================= */
   var STATUSES = ['待发', '在途', '已签收', '退回'];
   var SERVICE_OPTIONS = ['保价', '签收', '上门'];
-  var TAB_LABELS = { overview: '概览', waybills: '运单', zones: '分区', customers: '客户', bills: '账单' };
+  var TAB_LABELS = { overview: '概览', waybills: '运单', zones: '分区', customers: '客户', bills: '账单', compare: '双口径试算' };
   var FIELD_LABELS = {
     code: '编码/运单号', name: '名称', status: '状态', customerId: '客户',
     fromCity: '寄件城市', toCity: '收件城市', weightKg: '实际重量', volumeM3: '体积',
@@ -37,7 +37,16 @@
     billDetail: null,
     billLoading: false,
     quote: null,              // 最近一次单条计费结果
-    confirm: null             // { kind, id } 二次确认删除
+    confirm: null,            // { kind, id } 二次确认删除
+    compare: {
+      customerId: '',
+      period: '',
+      candidates: [],         // 当前客户+账期下的候选运单
+      picked: {},             // 勾选状态 waybillId -> true
+      result: null,           // 双口径试算结果
+      selectedId: '',
+      loading: false
+    }
   };
 
   var els = {};
@@ -242,6 +251,10 @@
       case 'bills':
         text = '账单清单 ' + num(state.bills.total) + ' 张';
         break;
+      case 'compare':
+        text = state.compare.result
+          ? '双口径试算 ' + num(state.compare.result.lines.length) + ' 单 · 差额 ' + signedMoney(state.compare.result.totals.diff.totalYuan) + ' 元'
+          : '双口径试算';
       default:
         text = '清单 0 条';
     }
@@ -1230,12 +1243,283 @@
     }
   }
 
+  /* ================= 双口径试算 ================= */
+  // 与后端 bills.periodOf 保持一致：按创建时刻换算到 UTC 的年月
+  function periodOfWaybill(waybill) {
+    var d = new Date(String(waybill.createdAt || ''));
+    if (isNaN(d.getTime())) return '';
+    return d.toISOString().slice(0, 7);
+  }
+
+  function signedMoney(value) {
+    var n = Number(value) || 0;
+    return (n > 0 ? '+' : '') + money(n);
+  }
+  function signedKg(value) {
+    var n = Number(value) || 0;
+    return (n > 0 ? '+' : '') + n.toFixed(2);
+  }
+  function diffClass(value) {
+    var n = Number(value) || 0;
+    if (n > 0) return 'd-pos';
+    if (n < 0) return 'd-neg';
+    return 'd-zero';
+  }
+  function pickedCompareIds() {
+    var picked = state.compare.picked || {};
+    return state.compare.candidates
+      .map(function (w) { return w.id; })
+      .filter(function (id) { return picked[id]; });
+  }
+
+  function renderCompareLeft() {
+    var cmp = state.compare;
+    var periodOptions = (state.periods || []).map(function (p) {
+      return '<option value="' + attr(p) + '"></option>';
+    }).join('');
+    var candidates = cmp.candidates || [];
+    var pickedIds = pickedCompareIds();
+    var allPicked = candidates.length > 0 && pickedIds.length === candidates.length;
+
+    var listHtml = candidates.length
+      ? '<label class="check"><input type="checkbox" id="cmpPickAll"' + (allPicked ? ' checked' : '') + '>全选（' + num(candidates.length) + ' 条候选，已选 ' + num(pickedIds.length) + ' 条）</label>' +
+      '<div class="pick-list">' + candidates.map(function (w) {
+        return '<label class="pick-row"><input type="checkbox" name="cmpPick" value="' + attr(w.id) + '"' + (cmp.picked[w.id] ? ' checked' : '') + '>' +
+          '<span class="pick-main"><b>' + esc(w.code) + '</b>' +
+          '<span>' + esc(w.toCity) + ' · ' + esc(w.zoneName) + ' · ' + esc(w.weightText || kg(w.weightKg)) + '</span></span></label>';
+      }).join('') + '</div>'
+      : '<p class="block-hint">选好客户与账期后点「载入候选运单」，也可以只勾其中一部分再试算。</p>';
+
+    var body =
+      '<div class="block"><h3 class="block-title">选一批运单</h3>' +
+      '<label class="field"><span class="field-label">客户</span>' +
+      '<select id="cmpCustomer">' + customerOptionsHtml(cmp.customerId, '请选择客户') + '</select></label>' +
+      '<label class="field"><span class="field-label">账期（按运单创建月份）</span>' +
+      '<input type="text" id="cmpPeriod" list="periodList" placeholder="2026-09" value="' + attr(cmp.period || defaultPeriod()) + '">' +
+      '<datalist id="periodList">' + periodOptions + '</datalist></label>' +
+      '<button type="button" class="btn btn-block" data-action="load-candidates">载入候选运单</button>' +
+      '</div>' +
+      '<div class="block"><h3 class="block-title">候选运单</h3>' + listHtml + '</div>' +
+      '<button type="button" class="btn btn-primary btn-block" data-action="run-compare">对已选 ' + num(pickedIds.length) + ' 条做双口径试算</button>' +
+      '<p class="foot-note">试算只读取数据、不落库、不锁定运单，可以反复试。</p>';
+    return paneBlock('双口径试算', 'POST /api/compare', body);
+  }
+
+  function compareWarningsHtml(result) {
+    var flags = result.flags || {};
+    var warnings = [];
+    if (flags.zoneMismatched) {
+      var names = {};
+      result.lines.forEach(function (line) { names[line.single.zoneName] = true; });
+      warnings.push('这批运单按各自收件城市归属到了不同分区：' + esc(Object.keys(names).join('、')) +
+        '。整批口径只取<b>第一条运单</b>的收件城市、且只认分区直接登记的城市（不看别名），全批共用「' +
+        esc((result.batchZone && result.batchZone.name) || '—') + '」，其余单的运费与偏远附加都会被算到别的分区价上。');
+    }
+    if (flags.customerMixed) {
+      warnings.push('勾选的运单分属不同客户：单条口径按各单自己客户的折扣算，整批口径统一用第一条运单客户的折扣（' +
+        esc(result.basis.customerName) + '，' + esc(discountTextOf(result.discountPermille)) + '）。');
+    }
+    if (!warnings.length) return '';
+    return '<div class="cmp-warn">' + warnings.map(function (text) {
+      return '<p>' + text + '</p>';
+    }).join('') + '</div>';
+  }
+
+  function compareSummaryHtml(result) {
+    var t = result.totals;
+    var cards = [
+      { label: '单条口径合计', value: money(t.single.totalYuan), sub: '运费 ' + money(t.single.freightYuan) + ' + 附加 ' + money(t.single.surchargeYuan), tone: '' },
+      { label: '整批口径合计', value: money(t.batch.totalYuan), sub: '运费 ' + money(t.batch.freightYuan) + ' + 附加 ' + money(t.batch.surchargeYuan), tone: '' },
+      { label: '合计差额（单 − 整）', value: signedMoney(t.diff.totalYuan), sub: '运费差 ' + signedMoney(t.diff.freightYuan) + ' · 附加差 ' + signedMoney(t.diff.surchargeYuan), tone: 'tone-amber' }
+    ];
+    return '<div class="cmp-summary">' + cards.map(function (card) {
+      return '<div class="metric-card ' + card.tone + '"><div class="metric-label">' + card.label + '</div>' +
+        '<div class="metric-value">' + card.value + '<span class="unit">元</span></div>' +
+        '<div class="metric-hint">' + card.sub + '</div></div>';
+    }).join('') + '</div>';
+  }
+
+  function renderCompareMid() {
+    var result = state.compare.result;
+    if (!result) {
+      return paneBlock('双口径并排试算', '', emptyBlock('还没有试算结果', '在左侧选客户与账期，载入候选运单后点「双口径试算」。'));
+    }
+    var t = result.totals;
+    var rows = result.lines.map(function (line) {
+      var selected = line.waybillId === state.compare.selectedId;
+      var mismatch = line.singleZoneMismatch;
+      return '<tr class="cmp-line' + (selected ? ' is-selected' : '') + (mismatch ? ' is-mismatch' : '') + '" data-action="select-compare-line" data-id="' + attr(line.waybillId) + '">' +
+        '<td>' + esc(line.code) + (mismatch ? '<span class="tag tag-warn">分区错配</span>' : '') + '</td>' +
+        '<td>' + esc(line.toCity) + '</td>' +
+        '<td class="zone-cell">' + esc(line.single.zoneName) + '</td>' +
+        '<td class="num">' + line.single.billableKg.toFixed(2) + '</td>' +
+        '<td class="num">' + money(line.single.freightYuan) + '</td>' +
+        '<td class="num">' + money(line.single.surchargeYuan) + '</td>' +
+        '<td class="num"><b>' + money(line.single.totalYuan) + '</b></td>' +
+        '<td class="zone-cell muted">' + esc(line.batch.zoneName) + '</td>' +
+        '<td class="num">' + line.batch.billableKg.toFixed(2) + '</td>' +
+        '<td class="num">' + money(line.batch.freightYuan) + '</td>' +
+        '<td class="num">' + money(line.batch.surchargeYuan) + '</td>' +
+        '<td class="num"><b>' + money(line.batch.totalYuan) + '</b></td>' +
+        '<td class="num ' + diffClass(line.diff.totalYuan) + '"><b>' + signedMoney(line.diff.totalYuan) + '</b></td>' +
+        '</tr>';
+    }).join('');
+
+    var table =
+      '<div class="table-wrap cmp-wrap"><table class="cmp-table"><thead>' +
+      '<tr>' +
+      '<th rowspan="2">运单号</th><th rowspan="2">收件城市</th>' +
+      '<th colspan="5" class="cmp-th-single">单条口径（每单各算）</th>' +
+      '<th colspan="5" class="cmp-th-batch">整批口径（重量合并算一次）</th>' +
+      '<th rowspan="2" class="num">合计差额<br><small>单 − 整</small></th>' +
+      '</tr><tr>' +
+      '<th>分区</th><th class="num">计重 kg</th><th class="num">运费</th><th class="num">附加</th><th class="num">合计</th>' +
+      '<th>分区</th><th class="num">计重 kg</th><th class="num">运费</th><th class="num">附加</th><th class="num">合计</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody>' +
+      '<tfoot><tr class="tfoot-row">' +
+      '<td colspan="2">合计（' + num(result.lines.length) + ' 单）</td>' +
+      '<td></td>' +
+      '<td class="num">' + t.single.billableKg.toFixed(2) + '</td>' +
+      '<td class="num">' + money(t.single.freightYuan) + '</td>' +
+      '<td class="num">' + money(t.single.surchargeYuan) + '</td>' +
+      '<td class="num">' + money(t.single.totalYuan) + '</td>' +
+      '<td></td>' +
+      '<td class="num">' + t.batch.billableKg.toFixed(2) + '</td>' +
+      '<td class="num">' + money(t.batch.freightYuan) + '</td>' +
+      '<td class="num">' + money(t.batch.surchargeYuan) + '</td>' +
+      '<td class="num">' + money(t.batch.totalYuan) + '</td>' +
+      '<td class="num ' + diffClass(t.diff.totalYuan) + '">' + signedMoney(t.diff.totalYuan) + '</td>' +
+      '</tr></tfoot></table></div>';
+
+    var body =
+      compareWarningsHtml(result) +
+      compareSummaryHtml(result) +
+      '<p class="block-hint">整批口径按第一条运单客户「' + esc(result.basis.customerName) + '」折扣 ' +
+      esc(discountTextOf(result.discountPermille)) + ' 统一折算；点表格一行可在右侧看这一单的逐项差额。</p>' +
+      table;
+    return paneBlock('双口径并排试算', result.lines.length + ' 条运单', body);
+  }
+
+  function algorithmDiffHtml(result) {
+    var t = result ? result.totals : null;
+    var surchargeNote = t
+      ? '两种口径都逐单算附加费再相加，<b>不会重复计算</b>；本批附加费差为 ' + signedMoney(t.diff.surchargeYuan) + ' 元' +
+        (Math.abs(t.diff.surchargeYuan) > 0.001 ? '，差额来自整批把部分单算到了别的分区（偏远附加不同）。' : '，本批没有差异。')
+      : '两种口径都逐单算附加费再相加，不会重复计算；只有分区被算错时偏远附加才会不同。';
+    var weightNote = t
+      ? '每单的计费重量两口径算法相同，本批合计都是 ' + t.single.billableKg.toFixed(2) + ' kg（重量差 ' + signedKg(t.diff.billableKg) + ' kg）；差别在合并后只算一次首重与一次续重进位。'
+      : '每单的计费重量两口径算法相同；差别在合并后只算一次首重与一次续重进位。';
+    var rows = [
+      ['分区怎么取', '每单按自己的收件城市归属分区；先查分区别名，再查直接登记的城市。', '只取批内第一条运单的收件城市，且只在分区直接登记的城市里匹配（不看别名），查不到落到第一个分区，全批共用这一个分区。'],
+      ['重量是否合并', '不合并。每单各自 max(实际重量, 体积重量) 并向上取 0.5kg，各自套首重续重价。', '各单先算出计费重量再全部相加；合并重量只套一次首重续重价，每单运费按自己的重量占比分摊。'],
+      ['首重 / 进位', '每单都收一次首重价，续重各自向上进位一次。', '全批只收一次首重价，续重只对总超重进位一次，通常比逐单便宜。'],
+      ['最低收费', '每单运费各自兜底一次最低收费（默认 8 元）。', '只对合并后的总运费兜底一次。'],
+      ['附加费是否重复', '偏远 / 超规 / 保价逐单计算后相加，不重复。', surchargeNote],
+      ['折扣', '每单按自己客户的折扣分别折（现结不折），逐单取到分。', '在整批运费加附加费的合计上统一折一次（用第一条运单客户的折扣），总额不逐分取整。']
+    ];
+    var body = '<p class="block-hint">' + weightNote + '</p>' +
+      '<div class="table-wrap algo-wrap"><table class="algo-table"><thead><tr>' +
+      '<th>区别点</th><th class="cmp-th-single">单条口径</th><th class="cmp-th-batch">整批口径</th>' +
+      '</tr></thead><tbody>' + rows.map(function (r) {
+        return '<tr><td><b>' + r[0] + '</b></td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+    return '<div class="block"><h3 class="block-title">两种口径在算法上的区别</h3>' + body + '</div>';
+  }
+
+  function renderCompareRight() {
+    var result = state.compare.result;
+    var detailHtml = '';
+    if (result) {
+      var line = result.lines.filter(function (l) { return l.waybillId === state.compare.selectedId; })[0];
+      if (!line) line = result.lines[0];
+      if (line) {
+        function side(title, tone, p) {
+          return '<div class="panel ' + tone + '"><h4 class="panel-title">' + title + '（' + esc(p.zoneName) + '）</h4>' +
+            '<div class="amount-row"><span>计费重量</span><b>' + p.billableKg.toFixed(2) + ' kg</b></div>' +
+            '<div class="amount-row"><span>运费</span><b>' + money(p.freightYuan) + ' 元</b></div>' +
+            '<div class="amount-row"><span>附加费</span><b>' + money(p.surchargeYuan) + ' 元</b></div>' +
+            '<div class="amount-row is-total"><span>合计</span><b>' + money(p.totalYuan) + ' 元</b></div></div>';
+        }
+        var facts =
+          '<div class="detail-head"><span class="detail-title">' + esc(line.code) + '</span>' +
+          '<span class="badge badge-plain">' + esc(line.customerName) + '</span></div>' +
+          '<dl class="kv-list">' +
+          '<dt>路由</dt><dd>' + esc(line.fromCity) + ' → ' + esc(line.toCity) + '</dd>' +
+          '<dt>实重 / 体积</dt><dd>' + line.weightKg.toFixed(2) + ' kg / ' + line.volumeM3.toFixed(3) + ' m³ · ' + num(line.pieces) + ' 件</dd>' +
+          '<dt>保价 / 服务</dt><dd>' + money(line.insuredAmountYuan) + ' 元 · ' + esc((line.services || []).length ? line.services.join('、') : '无') + '</dd>' +
+          '</dl>';
+        var diffs = '<div class="panel"><h4 class="panel-title">这一单的差额（单条 − 整批）</h4>' +
+          '<div class="amount-row"><span>计费重量差</span><b class="' + diffClass(line.diff.billableKg) + '">' + signedKg(line.diff.billableKg) + ' kg</b></div>' +
+          '<div class="amount-row"><span>运费差</span><b class="' + diffClass(line.diff.freightYuan) + '">' + signedMoney(line.diff.freightYuan) + ' 元</b></div>' +
+          '<div class="amount-row"><span>附加费差</span><b class="' + diffClass(line.diff.surchargeYuan) + '">' + signedMoney(line.diff.surchargeYuan) + ' 元</b></div>' +
+          '<div class="amount-row is-total"><span>合计差</span><b class="' + diffClass(line.diff.totalYuan) + '">' + signedMoney(line.diff.totalYuan) + ' 元</b></div></div>';
+        detailHtml = '<div class="block">' + facts + side('单条口径', 'is-amber', line.single) + side('整批口径', '', line.batch) + diffs + '</div>';
+      }
+    }
+    var head = result ? '' : '<p class="foot-note">先在左侧选批并试算，这里会显示选中运单的逐项差额。</p>';
+    return paneBlock('口径区别与逐单差额', '', head + detailHtml + algorithmDiffHtml(result));
+  }
+
+  async function loadCompareCandidates() {
+    var cmp = state.compare;
+    var customerEl = document.getElementById('cmpCustomer');
+    var periodEl = document.getElementById('cmpPeriod');
+    if (!customerEl || !periodEl) return;
+    cmp.customerId = customerEl.value;
+    cmp.period = String(periodEl.value).trim();
+    if (!cmp.customerId) { setStatus('要先选一个客户'); return; }
+    if (!/^[0-9]{4}-[0-9]{2}$/.test(cmp.period)) { setStatus('账期要形如 2026-09'); return; }
+    setStatus('正在载入候选运单…');
+    try {
+      var r = await api('GET', '/api/waybills?customerId=' + encodeURIComponent(cmp.customerId));
+      var list = ((r && r.waybills) || []).filter(function (w) { return periodOfWaybill(w) === cmp.period; });
+      cmp.candidates = list;
+      cmp.picked = {};
+      list.forEach(function (w) { cmp.picked[w.id] = true; });
+      cmp.result = null;
+      cmp.selectedId = '';
+      renderMid();
+      renderLeft();
+      setStatus('账期 ' + cmp.period + ' 载入候选运单 ' + list.length + ' 条');
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  async function runCompare() {
+    var ids = pickedCompareIds();
+    if (ids.length === 0) { setStatus('至少勾选一条运单再试算'); return; }
+    state.compare.loading = true;
+    setStatus('正在做双口径试算…');
+    try {
+      var result = await api('POST', '/api/compare', { waybillIds: ids });
+      state.compare.result = result;
+      state.compare.selectedId = result.lines.length ? result.lines[0].waybillId : '';
+      renderMid();
+      renderRight();
+      var d = result.totals.diff.totalYuan;
+      ok('试算完成：' + result.lines.length + ' 单，单条合计 ' + money(result.totals.single.totalYuan) +
+        '，整批合计 ' + money(result.totals.batch.totalYuan) + '，差额 ' + signedMoney(d) + ' 元（单 − 整）');
+    } catch (err) {
+      fail(err);
+    } finally {
+      state.compare.loading = false;
+    }
+  }
+
+  function selectCompareLine(id) {
+    state.compare.selectedId = id;
+    renderMid();
+    renderRight();
+  }
+
   /* ================= 渲染总入口 ================= */
   function renderLeft() {
     if (state.tab === 'overview') setLeft(renderOverviewLeft());
     else if (state.tab === 'waybills') setLeft(renderWaybillsLeft());
     else if (state.tab === 'zones') setLeft(renderZonesLeft());
     else if (state.tab === 'customers') setLeft(renderCustomersLeft());
+    else if (state.tab === 'compare') setLeft(renderCompareLeft());
     else setLeft(renderBillsLeft());
   }
   function renderMid() {
@@ -1243,6 +1527,7 @@
     else if (state.tab === 'waybills') setMid(renderWaybillsMid());
     else if (state.tab === 'zones') setMid(renderZonesMid());
     else if (state.tab === 'customers') setMid(renderCustomersMid());
+    else if (state.tab === 'compare') setMid(renderCompareMid());
     else setMid(renderBillsMid());
   }
   function renderRight() {
@@ -1250,6 +1535,7 @@
     else if (state.tab === 'waybills') setRight(renderWaybillsRight());
     else if (state.tab === 'zones') setRight(renderZonesRight());
     else if (state.tab === 'customers') setRight(renderCustomersRight());
+    else if (state.tab === 'compare') setRight(renderCompareRight());
     else setRight(renderBillsRight());
   }
 
@@ -1318,6 +1604,17 @@
     if (el.id === 'zoneStatus') { state.zoneFilter.status = el.value; renderMid(); renderLeft(); return; }
     if (el.id === 'customerSettle') { state.customerFilter.settle = el.value; renderMid(); renderLeft(); return; }
     if (el.id === 'customerStatus') { state.customerFilter.status = el.value; renderMid(); renderLeft(); return; }
+    if (el.id === 'cmpPickAll') {
+      var checked = el.checked;
+      state.compare.candidates.forEach(function (w) { state.compare.picked[w.id] = checked; });
+      renderLeft();
+      return;
+    }
+    if (el.name === 'cmpPick') {
+      state.compare.picked[el.value] = el.checked;
+      renderLeft();
+      return;
+    }
   }
 
   function onLeftKeydown(event) {
@@ -1530,6 +1827,10 @@
       case 'refresh-bills':
         try { await loadBills(); await loadPeriods(); await loadSummary(); render(); ok('账单清单已刷新，共 ' + state.bills.total + ' 张'); } catch (err) { fail(err); }
         break;
+
+      case 'load-candidates': loadCompareCandidates(); break;
+      case 'run-compare': await runCompare(); break;
+      case 'select-compare-line': selectCompareLine(id); break;
       default:
         break;
     }
