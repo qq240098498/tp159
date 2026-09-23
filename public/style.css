@@ -528,6 +528,57 @@ tbody tr:hover td { background: var(--slate-soft); }
 .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tfoot-row td { background: var(--slate-soft); font-weight: 700; color: var(--brand-deep); border-top: 1px solid var(--line-strong); }
 
+/* ---------------- 双口径试算 ---------------- */
+.cmp-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--amber-line);
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+  color: var(--amber-dark);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.cmp-strip b { font-weight: 700; }
+.cmp-strip .warn-text { font-weight: 600; }
+
+.cmp-card {
+  padding: 11px 13px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+.cmp-card:last-child { margin-bottom: 0; }
+
+.cmp-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 9px; }
+.cmp-col {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--slate-soft);
+}
+.cmp-col.is-batch { background: #fff; }
+.cmp-col-title { margin-bottom: 5px; font-size: 12px; font-weight: 700; color: var(--brand-dark); }
+.cmp-col.is-batch .cmp-col-title { color: var(--amber-dark); }
+
+.cmp-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 2px 0; font-size: 12.5px; }
+.cmp-line span { color: var(--muted); }
+.cmp-line b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cmp-line b.is-diff { color: var(--amber-dark); }
+.cmp-line.is-total { margin-top: 5px; padding-top: 6px; border-top: 1px dashed var(--line-strong); }
+.cmp-line.is-total b { color: var(--brand-deep); }
+
+.cmp-empty-side { margin: 0; font-size: 12px; color: var(--danger); line-height: 1.6; }
+
+.notes-list { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--ink-2); line-height: 1.7; }
+.notes-list li { margin-bottom: 8px; }
+.notes-list li:last-child { margin-bottom: 0; }
+.notes-list b { color: var(--brand-deep); }
+
 /* ---------------- 其它 ---------------- */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {

@@ -167,4 +167,4 @@ function listPeriods() {
   return { periods: Array.from(periods).sort() };
 }
 
-module.exports = { listBills, getBill, generateBill, voidBill, listPeriods, periodOf, zoneOf };
+module.exports = { listBills, getBill, generateBill, voidBill, listPeriods, periodOf, zoneOf, candidateWaybills };

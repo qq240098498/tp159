@@ -5,7 +5,7 @@
   /* ================= 常量 ================= */
   var STATUSES = ['待发', '在途', '已签收', '退回'];
   var SERVICE_OPTIONS = ['保价', '签收', '上门'];
-  var TAB_LABELS = { overview: '概览', waybills: '运单', zones: '分区', customers: '客户', bills: '账单' };
+  var TAB_LABELS = { overview: '概览', waybills: '运单', zones: '分区', customers: '客户', bills: '账单', compare: '试算' };
   var FIELD_LABELS = {
     code: '编码/运单号', name: '名称', status: '状态', customerId: '客户',
     fromCity: '寄件城市', toCity: '收件城市', weightKg: '实际重量', volumeM3: '体积',
@@ -36,6 +36,7 @@
     selectedBillId: '',
     billDetail: null,
     billLoading: false,
+    compare: { customerId: '', period: '', result: null, loading: false },  // 双口径试算
     quote: null,              // 最近一次单条计费结果
     confirm: null             // { kind, id } 二次确认删除
   };
@@ -61,6 +62,11 @@
   }
   function kg(value) { return money(value) + ' kg'; }
   function m3(value) { return (Number(value) || 0).toFixed(3) + ' m³'; }
+  // 差额显示：正数补上加号，一眼看出哪套口径更贵
+  function signedMoney(value) {
+    var n = Number(value) || 0;
+    return (n > 0 ? '+' : '') + money(n);
+  }
 
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
@@ -241,6 +247,11 @@
         break;
       case 'bills':
         text = '账单清单 ' + num(state.bills.total) + ' 张';
+        break;
+      case 'compare':
+        text = state.compare.result
+          ? ('试算 ' + state.compare.result.customer.name + ' · ' + state.compare.result.period + '，共 ' + num(state.compare.result.waybillCount) + ' 单')
+          : '双口径试算：还没有开始';
         break;
       default:
         text = '清单 0 条';
@@ -1230,12 +1241,158 @@
     }
   }
 
+  /* ================= 双口径试算 ================= */
+  function renderCompareLeft() {
+    var c = state.compare;
+    var periodOptions = (state.periods || []).map(function (p) {
+      return '<option value="' + attr(p) + '"></option>';
+    }).join('');
+    var body =
+      '<div class="block"><h3 class="block-title">选一批运单</h3>' +
+      '<label class="field" data-field-wrap="customerId"><span class="field-label">客户</span>' +
+      '<select id="cmpCustomer">' + customerOptionsHtml(c.customerId, '请选择客户') + '</select>' +
+      '<span class="field-msg"></span></label>' +
+      '<label class="field" data-field-wrap="period"><span class="field-label">账期（形如 2026-09）</span>' +
+      '<input type="text" id="cmpPeriod" list="cmpPeriodList" placeholder="2026-09" value="' + attr(c.period || defaultPeriod()) + '">' +
+      '<datalist id="cmpPeriodList">' + periodOptions + '</datalist>' +
+      '<span class="field-msg"></span></label>' +
+      '<button type="button" class="btn btn-primary btn-block" data-action="run-compare">开始试算</button>' +
+      '<p class="foot-note">选出的就是出账那一批（同客户同账期），按两种口径各算一遍，只看不写。</p>' +
+      '</div>' +
+      '<div class="block"><h3 class="block-title">两种口径差在哪</h3>' +
+      '<ul class="notes-list">' +
+      '<li><b>重量是否合并：</b>单条口径每单各自算首重续重、各自过最低收费；整批口径重量加总只算一次，再按重量占比分摊。</li>' +
+      '<li><b>分区是否同一块：</b>单条口径每单按自己的收件城市找分区（认别名）；整批口径全批共用第一单城市定的分区（不认别名，找不到退到第一个分区）。</li>' +
+      '<li><b>附加费是否重复：</b>偏远附加单条按各自分区收、整批每单按共享分区收一次；超规与保价两种口径都按单各自收。</li>' +
+      '</ul></div>';
+    return paneBlock('双口径试算', 'GET /api/compare', body);
+  }
+
+  function compareCardHtml(row) {
+    var s = row.single;
+    var b = row.batch;
+    var diffTag;
+    if (row.diffYuan === null || row.diffYuan === undefined) diffTag = '<span class="tag tag-warn">比不了</span>';
+    else if (row.diffYuan > 0) diffTag = '<span class="tag tag-warn">单条贵 ' + esc(money(row.diffYuan)) + '</span>';
+    else if (row.diffYuan < 0) diffTag = '<span class="tag tag-amber">整批贵 ' + esc(money(-row.diffYuan)) + '</span>';
+    else diffTag = '<span class="tag">两口径一致</span>';
+
+    var zoneDiff = s.zoneKnown && b && s.zoneId !== b.zoneId;
+    var singleCol = s.zoneKnown
+      ? '<div class="cmp-line"><span>分区</span><b' + (zoneDiff ? ' class="is-diff"' : '') + '>' + esc(s.zoneName) + '</b></div>' +
+        '<div class="cmp-line"><span>计费重量</span><b>' + esc(kg(s.billableKg)) + '</b></div>' +
+        '<div class="cmp-line"><span>运费</span><b>' + esc(money(s.freightYuan)) + '</b></div>' +
+        '<div class="cmp-line"><span>附加费</span><b>' + esc(money(s.surchargeYuan)) + '</b></div>' +
+        '<div class="cmp-line is-total"><span>合计</span><b>' + esc(money(s.totalYuan)) + '</b></div>'
+      : '<p class="cmp-empty-side">收件城市「' + esc(row.toCity) + '」没归属任何分区，单条口径算不出。</p>';
+    var batchCol = b
+      ? '<div class="cmp-line"><span>分区</span><b' + (zoneDiff ? ' class="is-diff"' : '') + '>' + esc(b.zoneName) + '</b></div>' +
+        '<div class="cmp-line"><span>计费重量</span><b>' + esc(kg(b.billableKg)) + '</b></div>' +
+        '<div class="cmp-line"><span>运费分摊</span><b>' + esc(money(b.freightYuan)) + '</b></div>' +
+        '<div class="cmp-line"><span>附加费</span><b>' + esc(money(b.surchargeYuan)) + '</b></div>' +
+        '<div class="cmp-line is-total"><span>合计</span><b>' + esc(money(b.totalYuan)) + '</b></div>'
+      : '<p class="cmp-empty-side">还没有任何分区，整批口径也算不出。</p>';
+
+    return '<article class="cmp-card">' +
+      '<div class="card-top"><span class="card-code">' + esc(row.code) + '</span>' + diffTag + '</div>' +
+      '<div class="card-sub">收件城市 ' + esc(row.toCity) + (row.hasQuoteCache ? ' · 有计费缓存' : '') + '</div>' +
+      '<div class="cmp-cols">' +
+      '<div class="cmp-col"><div class="cmp-col-title">按单条</div>' + singleCol + '</div>' +
+      '<div class="cmp-col is-batch"><div class="cmp-col-title">按整批</div>' + batchCol + '</div>' +
+      '</div></article>';
+  }
+
+  function renderCompareMid() {
+    var c = state.compare;
+    if (c.loading) return paneBlock('逐单对比', '', loadingBlock('正在按两种口径试算…'));
+    var result = c.result;
+    if (!result) {
+      return paneBlock('逐单对比', '', emptyBlock('还没有试算结果', '在左侧选好客户与账期，点「开始试算」。'));
+    }
+    var t = result.totals;
+    var strip = '<div class="cmp-strip">' +
+      '<span>共 <b>' + num(result.waybillCount) + '</b> 单</span>' +
+      '<span>单条合计 <b>' + esc(money(t.single.totalYuan)) + '</b> 元</span>' +
+      '<span>整批合计 <b>' + esc(money(t.batch.totalYuan)) + '</b> 元</span>' +
+      '<span>差额 <b>' + esc(signedMoney(t.diffYuan)) + '</b> 元</span>' +
+      (t.single.pricedCount < result.waybillCount ? '<span class="warn-text">' + num(result.waybillCount - t.single.pricedCount) + ' 单单条口径算不出，未计入单条合计</span>' : '') +
+      '</div>';
+    var cards = result.rows.map(compareCardHtml).join('');
+    return paneBlock('逐单对比', result.customer.name + ' · ' + result.period, strip + cards);
+  }
+
+  function renderCompareRight() {
+    var c = state.compare;
+    if (c.loading) return paneBlock('合计与口径说明', '', loadingBlock('正在试算…'));
+    var result = c.result;
+    if (!result) {
+      return paneBlock('合计与口径说明', '', emptyBlock('还没有试算结果', '试算后这里给出合计对照、这批运单的口径事实，以及两种口径在算法上的区别。'));
+    }
+    var t = result.totals;
+    var sz = result.sharedZone;
+    var facts = [];
+    if (sz) {
+      facts.push('<dt>共享分区</dt><dd class="' + (sz.matched ? '' : 'is-warn') + '">' + esc(sz.name) + '（' + esc(sz.code) + '），取自第一单 ' + esc(result.rows[0].code) + ' 的收件城市「' + esc(sz.sourceCity) + '」' + (sz.matched ? '' : '；该城市没匹配上登记城市，退到了第一个分区') + '</dd>');
+    }
+    facts.push('<dt>分区不一致</dt><dd class="' + (result.zoneDifferCount > 0 ? 'is-amber' : '') + '">' + num(result.zoneDifferCount) + ' 单自己的分区与共享分区不同</dd>');
+    if (result.unzonedCities.length) {
+      facts.push('<dt>未归属城市</dt><dd class="is-warn">' + esc(result.unzonedCities.join('、')) + '（单条口径算不出）</dd>');
+    }
+    if (result.cachedCodes.length) {
+      facts.push('<dt>计费缓存</dt><dd class="is-amber">' + num(result.cachedCodes.length) + ' 单有缓存（' + esc(result.cachedCodes.join('、')) + '），正式出账会取缓存，本试算未使用</dd>');
+    }
+
+    var body =
+      '<div class="panel is-amber">' +
+      '<h4 class="panel-title">合计对照（' + num(result.waybillCount) + ' 单）</h4>' +
+      '<div class="amount-row"><span>按单条 · 运费</span><b>' + esc(money(t.single.freightYuan)) + ' 元</b></div>' +
+      '<div class="amount-row"><span>按单条 · 附加费</span><b>' + esc(money(t.single.surchargeYuan)) + ' 元</b></div>' +
+      '<div class="amount-row"><span>按单条 · 合计</span><b>' + esc(money(t.single.totalYuan)) + ' 元</b></div>' +
+      '<div class="amount-row"><span>按整批 · 运费</span><b>' + esc(money(t.batch.freightYuan)) + ' 元</b></div>' +
+      '<div class="amount-row"><span>按整批 · 附加费</span><b>' + esc(money(t.batch.surchargeYuan)) + ' 元</b></div>' +
+      '<div class="amount-row"><span>按整批 · 合计</span><b>' + esc(money(t.batch.totalYuan)) + ' 元</b></div>' +
+      '<div class="amount-row is-total"><span>差额（单条 − 整批）</span><b>' + esc(signedMoney(t.diffYuan)) + ' 元</b></div>' +
+      '</div>' +
+      '<div class="block"><h3 class="block-title">这批运单的口径事实</h3><dl class="kv-list">' + facts.join('') + '</dl></div>' +
+      '<div class="block"><h3 class="block-title">两种口径在算法上的区别</h3><ul class="notes-list">' +
+      result.notes.map(function (note) { return '<li>' + esc(note) + '</li>'; }).join('') +
+      '</ul></div>' +
+      '<div class="btn-stack"><button type="button" class="btn btn-ghost" data-action="run-compare">按当前选择重新试算</button></div>';
+    return paneBlock('合计与口径说明', result.customer.name + ' · ' + result.period, body);
+  }
+
+  async function runCompare() {
+    var customerEl = document.getElementById('cmpCustomer');
+    var periodEl = document.getElementById('cmpPeriod');
+    if (customerEl) state.compare.customerId = String(customerEl.value || '').trim();
+    if (periodEl) state.compare.period = String(periodEl.value || '').trim();
+    clearFieldErrors();
+    clearNotice();
+    state.compare.loading = true;
+    renderMid();
+    renderRight();
+    try {
+      var qs = '?customerId=' + encodeURIComponent(state.compare.customerId) + '&period=' + encodeURIComponent(state.compare.period);
+      var result = await api('GET', '/api/compare' + qs);
+      state.compare.result = result;
+      state.compare.loading = false;
+      render();
+      ok('试算完成：' + result.customer.name + ' · ' + result.period + '，共 ' + num(result.waybillCount) + ' 单，两口径差额 ' + signedMoney(result.totals.diffYuan) + ' 元');
+    } catch (err) {
+      state.compare.loading = false;
+      renderMid();
+      renderRight();
+      fail(err);
+    }
+  }
+
   /* ================= 渲染总入口 ================= */
   function renderLeft() {
     if (state.tab === 'overview') setLeft(renderOverviewLeft());
     else if (state.tab === 'waybills') setLeft(renderWaybillsLeft());
     else if (state.tab === 'zones') setLeft(renderZonesLeft());
     else if (state.tab === 'customers') setLeft(renderCustomersLeft());
+    else if (state.tab === 'compare') setLeft(renderCompareLeft());
     else setLeft(renderBillsLeft());
   }
   function renderMid() {
@@ -1243,6 +1400,7 @@
     else if (state.tab === 'waybills') setMid(renderWaybillsMid());
     else if (state.tab === 'zones') setMid(renderZonesMid());
     else if (state.tab === 'customers') setMid(renderCustomersMid());
+    else if (state.tab === 'compare') setMid(renderCompareMid());
     else setMid(renderBillsMid());
   }
   function renderRight() {
@@ -1250,6 +1408,7 @@
     else if (state.tab === 'waybills') setRight(renderWaybillsRight());
     else if (state.tab === 'zones') setRight(renderZonesRight());
     else if (state.tab === 'customers') setRight(renderCustomersRight());
+    else if (state.tab === 'compare') setRight(renderCompareRight());
     else setRight(renderBillsRight());
   }
 
@@ -1516,6 +1675,7 @@
         break;
 
       case 'generate-bill': await generateBill(); break;
+      case 'run-compare': await runCompare(); break;
       case 'select-bill': await selectBill(id); break;
       case 'reload-bill': await loadBillDetail(id); if (state.billDetail) setStatus('已重新读取账单 ' + state.billDetail.code + ' 的明细'); break;
       case 'void-bill':
